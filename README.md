@@ -110,7 +110,7 @@ sh scripts/extract_frame.sh 41
 #### 2. Person Detection
 
 Run steps below for person detection.
-- Install BoT-SORT as instracted in Environment Requirement section above [here](#install).
+- Install BoT-SORT as instructed in Environment Requirement section above [here](#install).
 - Prepare Models. Download the pretrained YOLOX_x model from [ByteTrack [Google Drive]](https://drive.google.com/file/d/1P4mY0Yyd3PPTybgZkjMYhFri88nTmJX5/view), and store it to BoT-SORT directory.
 - Run person detection by executing a command below.
 ```
@@ -120,17 +120,17 @@ sh scripts/detection.sh 41
 #### 3. Feature extraction
 
 Run steps below to get feature extraction.
-- Install deep-person-reid as instracted in Environment Requirement section above [here](#install).
-- Prepare Models. Download the pretrained deep-person-reid model from [torchreid](https://kaiyangzhou.github.io/deep-person-reid/MODEL_ZOO). By running a script mentioned below will donwload this pretrained model automatically and will store it accordingly.
+- Install deep-person-reid as instructed in Environment Requirement section above [here](#install).
+- Prepare Models. Download the pretrained deep-person-reid model from [torchreid](https://kaiyangzhou.github.io/deep-person-reid/MODEL_ZOO). By running a script mentioned below will download this pretrained model automatically and will store it accordingly.
 - Run feature extraction by executing a command below.
 ```
 sh scripts/embedding.sh 41
 ```
 
-#### 4. Pose estimation (To be confirmed and updated)
+#### 4. Pose estimation
 
 Run steps below to get pose estimation.
-- Install mmpose as instracted in Environment Requirement section above [here](#install).
+- Install mmpose as instructed in Environment Requirement section above [here](#install).
 - Run pose estimation by executing a command below.
 ```
 sh scripts/pose.sh 41
