@@ -1,6 +1,6 @@
 # CVPRW2024: Overlap Suppression Clustering for Offline Multi-Camera People Tracking
 
-The highest HOTA submission in the 8th NVIDIA AI City Challenge (2024) Track 1: Multi-Camera People Tracking. This submission placed 2nd place in the competition due to its offline tracking algorithm.  
+The highest HOTA submission in the 8th NVIDIA AI City Challenge (2024) Track 1: Multi-Camera People Tracking. This submission placed 2nd in the competition due to its offline tracking algorithm.  
 [[Arxiv]](https://arxiv.org/pdf/2404.xxxxx.pdf) (Note: The link will be updated once it's published.)
 
 ## Dataset Availability
