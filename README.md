@@ -1,6 +1,7 @@
 # CVPRW2024: Overlap Suppression Clustering for Offline Multi-Camera People Tracking
 
-This is the official repository for the 8th NVIDIA AI City Challenge (2024) Track 1: Multi-Camera People Tracking. [[Arxiv]](https://arxiv.org/pdf/2404.xxxxx.pdf) (Note: The link will be updated once it's published.)
+The highest HOTA submission in the 8th NVIDIA AI City Challenge (2024) Track 1: Multi-Camera People Tracking. This submission placed 2nd place in the competition due to its offline tracking algorithm.  
+[[Arxiv]](https://arxiv.org/pdf/2404.xxxxx.pdf) (Note: The link will be updated once it's published.)
 
 ## Dataset Availability
 
@@ -88,7 +89,7 @@ However we'll utilize pre-trained models for those. Therefore there's nothing to
 
 ## Running Tracking
 
-### Prearation
+### Preparation
 #### 0. Place your video files.
 
 Place your video files to under directory that corresponds to scene/camera IDs, such as Original/<scene_nnn>/<camera_nnnn>/video.mp4.
