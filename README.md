@@ -3,6 +3,21 @@
 The highest HOTA submission in the 8th NVIDIA AI City Challenge (2024) Track 1: Multi-Camera People Tracking. This submission placed 2nd in the competition due to its offline tracking algorithm.  
 [[Paper]](https://openaccess.thecvf.com/content/CVPR2024W/AICity/papers/Yoshida_Overlap_Suppression_Clustering__for_Offline_Multi-Camera_People_Tracking_CVPRW_2024_paper.pdf)
 
+## Release Note
+The new program (released on November 25, 2024) is a refactored version of a [previously published program](https://github.com/riips/AIC24_Track1_YACHIYO_RIIPS/tree/main).<br>
+Improvement summary is shown below.
+
+### === Improvement summary ===
+#### 1. Enhanced code readability and maintainability.
+#### 2. Improved versatility of the representative image extraction process:
+**(1) Consideration intersections with bounding boxes in the foreground.**<br>
+Our method evaluates identifiability based on the confidence scores of keypoints. Keypoints are assigned to each bounding box, which can sometimes lead to errors where keypoints are attributed to the closer person in occluded images. This error can result in selecting a low-identifiability image as a high-identifiability image. The new program identifies images causing occlusion and those affected by occlusion based on the y-coordinate of the bottom edge of the bounding boxes. By considering the intersections calculated for images causing occlusion, we achieve a more stable extraction of representative images.<br>
+
+ **(2) Addressing self-occlusion.**<br>
+Non-occluded images, which are not obstructed by other people or objects, typically exhibit a high confidence score in many cases. However, confidence scores of the elbow and wrist can sometimes decrease due to occlusion by the self-torso.
+This condition can hinder the selection of highly identifiable images.
+The new program addresses this issue, referred to as self-occlusion. 
+
 ## Dataset Availability
 
 The official dataset can be downloaded from the AI City Challenge website (https://www.aicitychallenge.org/2024-data-and-evaluation/). You need to fill out the dataset request form to obtain the password to download them.
