@@ -85,7 +85,7 @@ def main():
     )
 
 
-    assert has_mmdet, 'Please install mmdet to run the demo.'
+    #assert has_mmdet, 'Please install mmdet to run the demo.'
 
     args = parser.parse_args()
 
@@ -153,6 +153,7 @@ def main():
 
         # # keep the person class bounding boxes.
         # person_results = process_mmdet_results(mmdet_results, args.det_cat_id)
+        frame_id += 1
         if frame_id not in track_results.keys():
             continue
         person_results = track_results[frame_id]

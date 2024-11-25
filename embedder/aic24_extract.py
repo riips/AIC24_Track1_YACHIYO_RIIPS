@@ -17,14 +17,16 @@ import json
 def make_parser():
     parser = argparse.ArgumentParser("reid")
     parser.add_argument("root_path", type=str, default=None)
-    parser.add_argument("-s", "--scene", type=str, default=None)
+    parser.add_argument("-s", "--scene", type=int, default=None)
     return parser
 
 if __name__ == "__main__":
 
     args = make_parser().parse_args()
     data_root = args.root_path
-    scene = args.scene
+    scene = f"scene_{args.scene:03}"
+    scene_out = f"Scene{args.scene:02}"
+    model_name = "osnet_x1_0"
 
     sys.path.append(data_root+'/deep-person-reid')
 
@@ -84,10 +86,10 @@ if __name__ == "__main__":
                         print('process {}/{}'.format(idx,len(dets)))
                     if cur_frame != int(frame):
                         cur_frame = int(frame)
-                    if not os.path.isdir(osp.join(out_dir,scene,cam)):
-                        os.makedirs(osp.join(out_dir,scene,cam))
-                    save_fn = os.path.join(out_dir,scene,cam,'feature_{}_{}_{}_{}_{}_{}_{}.npy'.format(cur_frame,u_num,str(int(x1)),str(int(x2)),str(int(y1)),str(int(y2)),str(conf).replace(".","")))
-                    jf[str(idx).zfill(8)]['NpyPath'] = os.path.join(scene,cam,'feature_{}_{}_{}_{}_{}_{}_{}.npy'.format(cur_frame,u_num,str(int(x1)),str(int(x2)),str(int(y1)),str(int(y2)),str(conf).replace(".","")))
+                    cam_out = f'Camera{int(cam.split("_")[1]):03}'
+                    save_fn = os.path.join(out_dir,model_name,scene_out,cam_out,'feature_{}_{}_{}_{}_{}_{}_{}.npy'.format(cur_frame,u_num,str(int(x1)),str(int(x2)),str(int(y1)),str(int(y2)),str(conf).replace(".","")))
+                    os.makedirs(osp.dirname(save_fn), exist_ok=True)
+                    jf[str(idx).zfill(8)]['NpyPath'] = os.path.join(scene_out,cam_out,'feature_{}_{}_{}_{}_{}_{}_{}.npy'.format(cur_frame,u_num,str(int(x1)),str(int(x2)),str(int(y1)),str(int(y2)),str(conf).replace(".","")))
                     img_path = os.path.join(img_dir,scene,cam,'Frame',frame.zfill(6)+'.jpg')
                     img = Image.open(img_path)
         
