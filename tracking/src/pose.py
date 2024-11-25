@@ -2,52 +2,184 @@ import os
 import numpy as np
 import json
 import cv2
+import sys
+from collections import defaultdict #, deque,Counter, 
 
-class PoseKeypoints:
-    def __init__(self, keypoint_json):
-        self.kp_indice_foot = [15, 16] # ankles
-        self.kp_indice_torso = [5, 6, 11, 12, 13, 14] # shoulders, hips, knees
-        self.kp_indice_torso_legs = [5, 6, 11, 12, 13, 14, 15, 16] # shoulders, hips, knees, ankles
+from scipy.spatial import ConvexHull, QhullError  
+from shapely.geometry import Point, Polygon, box
+from shapely.ops import unary_union
 
-        self._parse_keypoint_json(keypoint_json)
+from utils import ParameterManager, TrackingFunctions, JSONHandler, DirectoryStructure
+from parameters import CommonParameters,PreprocessParameters
+
+class UnifiedPoseFormat:
+    def __init__(self, format_type="Coco"):
+        self.format_type = format_type
+     
+        self.index2part = self._get_index2part(self.format_type)
+        self.part2index = self._get_part2index(self.index2part)
+        self.connection_info = self._get_connection_info(self.format_type)
+
+    def _get_index2part(self,format_type: str):
+        match format_type:
+            case "Coco":
+              index2part = {
+                  0: ["nose", "mid"],
+                  1: ["eye", "left"],
+                  2: ["eye", "right"],
+                  3: ["ear", "left"],
+                  4: ["ear", "right"],
+                  5: ["shoulder", "left"],
+                  6: ["shoulder", "right"],
+                  7: ["elbow", "left"],
+                  8: ["elbow", "right"],
+                  9: ["wrist", "left"],
+                  10: ["wrist", "right"],
+                  11: ["hip", "left"],
+                  12: ["hip", "right"],
+                  13: ["knee", "left"],
+                  14: ["knee", "right"],
+                  15: ["ankle", "left"],
+                  16: ["ankle", "right"]}
+            case "CrowdPose": 
+              index2part = {
+                  0: ["shoulder", "left"],
+                  1: ["shoulder", "right"],
+                  2: ["elbow", "left"],
+                  3: ["elbow", "right"],
+                  4: ["wrist", "left"],
+                  5: ["wrist", "right"],
+                  6: ["hip", "left"],
+                  7: ["hip", "right"],
+                  8: ["knee", "left"],
+                  9: ["knee", "right"],
+                  10: ["ankle", "left"],
+                  11: ["ankle", "right"],
+                  12: ["nose", "mid"],
+                  13: ["neck", "mid"]}
+            case _:
+              raise ValueError(f"Unsupported format: {format_type}")
+        return index2part
+
+    def _get_part2index(self,index2part):
+
+        part2index = defaultdict(list)
+        for index, (body_part,position) in index2part.items():
+            part2index[body_part].append(index)
+
+        body_regions = {"head":["nose","eye","ear"],
+                        "torso":["shoulder","hip"],
+                        "leg":["knee","ankle"],
+                        "arm":["elbow","wrist"]}
+        
+        for body_region, body_parts in body_regions.items():
+            for body_part in body_parts:
+                part2index[body_region].extend(part2index[body_part])
+
+        for body_region in ["left","right"]:
+            for index, (body_part,position) in index2part.items():
+                if position in [body_region,"mid"]:
+                    part2index[body_region].append(index)
+
+        return dict(part2index)
+
+    def _get_connection_info(self,format_type: str):
+        """
+        keypointのjointとなるindexを取得する
+        """
+        match format_type:
+            case "Coco":
+              connection_info = {
+                  0: [1,2],
+                  1: [0,2,3],
+                  2: [0,1,4],
+                  3: [1,5],
+                  4: [2,6],
+                  5: [3,6,7,11],
+                  6: [4,5,8,12],
+                  7: [5,9],
+                  8: [6,10],
+                  9: [7],
+                  10: [8],
+                  11: [5,12,13],
+                  12: [6,11,14],
+                  13: [11,15],
+                  14: [12,16],
+                  15: [13],
+                  16: [14]}
+            case "CrowdPose":
+                connection_info = {
+                  0: [2,6,13],
+                  1: [3,7,13],
+                  2: [0,4],
+                  3: [1,5],
+                  4: [2],
+                  5: [3],
+                  6: [0,7,8],
+                  7: [1,6,9],
+                  8: [6,10],
+                  9: [7,11],
+                  10: [8],
+                  11: [9],
+                  12: [13],
+                  13: [0,1,12]}
+            case _:
+                raise ValueError(f"Unsupported format: {format_type}")
+        return connection_info
+
+    def _get_value(self,dict_,key):
+        value = dict_.get(key)
+        if value is None:
+            raise KeyError(f"Key {key} not found in dictionary")
+        return value
+    
+    def get_indices(self,body_part):
+        return self._get_value(self.part2index,body_part)
+
+    def get_body_part(self,index):
+        return self._get_value(self.index2part,index)
+
+    def get_connection(self,index):
+        return self._get_value(self.connection_info,index)
+
+class PolygonProcessor:
+    @staticmethod
+    def check_is_inside(test_points, polygon_points):
+        """
+        test_pointsがポリゴン内に存在するか否かをTrue or Falseで返す。
+        """
+        try:
+            hull = ConvexHull(polygon_points)
+            sorted_polygon_points = [polygon_points[i] for i in hull.vertices]
+        except QhullError:
+            #polygon_pointsによってポリゴンが生成できない場合
+            return None
+        polygon = Polygon(sorted_polygon_points)
+        is_inside_list = [polygon.covers(Point(point)) for point in test_points]
+        return is_inside_list
+    
+    @staticmethod
+    def calculate_intersect_ratio(query_bbox, gallery_bboxes):
+        """
+        gallery_bboxesをconcatした上で、queryとのintersect_ratioを測る
+        """
+        query_box = box(*query_bbox)
+        gallery_boxes = [box(*bbox) for bbox in gallery_bboxes]
+        gallery_union = unary_union(gallery_boxes)
+        intersect = query_box.intersection(gallery_union).area
+        query_area = query_box.area
+        return intersect/query_area
+
+class PoseAdaptor(CommonParameters,ParameterManager):
+    def __init__(self, tracking_dict, common_params): 
+        CommonParameters.__init__(self)
+        ParameterManager.__init__(self)
+        if common_params:
+            self.update_params(common_params)
+
+        pose_results = DirectoryStructure(common_params).get_pose_result()
         self.serial_dict = {}
-
-    def _parse_keypoint_json(self, file_path):
-        if os.path.isfile(file_path):
-            with open(file_path, 'r') as file:
-                data = json.load(file)
-            self.keypoints = data
-        else:
-            raise Exception(f"Keypoint json file '{file_path}' does not exist.")
-
-    def filter(self, keypoints=None, score_thr=0.3, target_parts="torso_legs", max_frames=0):
-        filtered = {}
-        if keypoints == None:
-            keypoints = self.keypoints
-        for i, frame in enumerate(keypoints):
-            if max_frames != 0 and i >= max_frames:
-                break
-            detections = keypoints[frame]
-            target_indices = self.kp_indice_torso if target_parts == "torso" else self.kp_indice_torso_legs
-            for det in detections:
-                kps = det["keypoints"]
-                confidences = [k for i2, k in enumerate(kps) if i2 in target_indices and k[2] >= score_thr]
-                if len(confidences) < (len(target_indices)):
-                    continue
-
-                pose_entity = [det["bbox"], ]
-                if int(frame) in filtered:
-                    filtered[frame].append(det)
-                else:
-                    filtered[frame] = [det]
-        print(f"Num of filtered results: {len(filtered)}")
-        return filtered
-
-    def summary(self): # Just show top_n data
-        if len(self.keypoints) <= 0:
-            print(f"Empty keypoints")
-            return
-        print(f"Number of frames: {len(self.keypoints)}")
+        self.assign_serial_from_tracking_dict(tracking_dict=tracking_dict,keypoints=pose_results)
 
     def get_keypoints(self, serial:str):
         """
@@ -56,16 +188,12 @@ class PoseKeypoints:
         
         serial: zero-filled 8-digit string
         """
-        if isinstance(serial, int):
-            serial = f"{serial:08d}"
-        elif isinstance(serial, str) and len(serial) != 8:
-            serial = f"{int(serial):08d}"
-        if len(self.serial_dict) <= 0:
+        serial = f"{str(serial).zfill(self.bbox_digit)}"
+
+        if len(self.serial_dict) == 0:
             raise Exception(f"Serial based dictionary is not built yet.")
-        if serial in self.serial_dict:
-            return self.serial_dict[serial]
-        else:
-            return None
+        
+        return self.serial_dict.get(serial)
 
     def _build_serial_dict(self, keypoints=None):
         """
@@ -96,21 +224,16 @@ class PoseKeypoints:
         """
         if keypoints == None:
             keypoints = self.keypoints
-        if isinstance(tracking_dict, str):
-            if os.path.isfile(tracking_dict):
-                with open(tracking_dict) as f:
-                    tracking_dict = json.load(f)
+
         tracking_coord = {}
-        for serial in tracking_dict:
-            td_coord = tracking_dict[serial]["Coordinate"]
-            td_frame = tracking_dict[serial]["Frame"]
+        for serial,value in tracking_dict.items():
+            td_coord = value["Coordinate"]
+            td_frame = value["Frame"]
             key = f"{td_frame}_{td_coord['x1']}_{td_coord['y1']}_{td_coord['x2']}_{td_coord['y2']}"
             if key in tracking_coord:
                 continue #raise Exception(f"DUP! {key}")
             tracking_coord[key] = serial
-        for frame in keypoints:
-            detections = keypoints[frame]
-    
+        for frame, detections in keypoints.items(): 
             for det in detections:
                 bbox = det["bbox"]
                 key = f"{int(frame)}_{int(bbox[0])}_{int(bbox[1])}_{int(bbox[2])}_{int(bbox[3])}"
@@ -123,153 +246,190 @@ class PoseKeypoints:
         # Build dict with serial as key
         return self._build_serial_dict(keypoints=keypoints)
 
-    def show_footpoints(self, keypoints=None, frame_img_root="Frames", output_mp4=None, score_thr=0.3, target_parts="torso_legs", max_frames=0): # Generate mp4
-        # Creating mp4
-        if output_mp4 == None:
-            output_mp4 = f"foot_points.mp4"
-        fourcc = cv2.VideoWriter_fourcc('m', 'p', '4', 'v')
-        video_wtr  = cv2.VideoWriter(output_mp4, fourcc=fourcc, fps=30.0, frameSize=(1280, 960))
-        if not video_wtr.isOpened():
-            print(f"Cannot open video writer.")
-            return
+class IdentifiabilityEvaluator(TrackingFunctions,CommonParameters,PreprocessParameters,ParameterManager):
+    def __init__(self,tracking_dict,common_params={}):
+        CommonParameters.__init__(self)
+        PreprocessParameters.__init__(self)
+        ParameterManager.__init__(self)
 
-        filtered = self.filter(keypoints=keypoints, score_thr=score_thr, target_parts=target_parts, max_frames=max_frames)
-        for frame in filtered:
-            # Read frame image file
-            frame_img_path = os.path.join(frame_img_root, f"{int(frame):06d}.jpg")
-            frame_img = cv2.imread(frame_img_path)
-            detections = self.keypoints[frame]
-            target_indices = self.kp_indice_torso if target_parts == "torso" else self.kp_indice_torso_legs
-            for det in detections:
-                keypoints = det["keypoints"]
-                left_ankle, right_ankle = keypoints[self.kp_indice_foot[0]], keypoints[self.kp_indice_foot[1]]
-                if float(left_ankle[2]) >= score_thr:
-                    color = (0, 255, 0)
-                else:
-                    #print(f"Low confidence on KP[15]: {float(fp1[2])}")
-                    color = (0, 0, 255)
-                cv2.circle(frame_img, (int(left_ankle[0]), int(left_ankle[1])), 5, color, 3)
-                
-                if float(right_ankle[2]) >= score_thr:
-                    color = (0, 255, 0)
-                else:
-                    #print(f"Low confidence on KP[16]: {float(fp2[2])}")
-                    color = (0, 0, 255)
-                cv2.circle(frame_img, (int(right_ankle[0]), int(right_ankle[1])), 5, color, 3)
-            frame_img = cv2.resize(frame_img, (1280, 960))
-            video_wtr.write(frame_img)
-        video_wtr.release()
-        print(f"Saved video file: {output_mp4}\n")
+        if common_params:
+            self.update_params(common_params)
+        self.tracking_dict = tracking_dict
+        self.unified_pose_format = UnifiedPoseFormat(self.pose_format)
+        self.keypoints_results = PoseAdaptor(tracking_dict, common_params)
 
-    def show_footpoints_custom(self, frame_img_root="Frames", output_mp4=None, score_thr=0.3, target_parts="torso_legs"): # Generate mp4
-        # Creating mp4
-        if output_mp4 == None:
-            output_mp4 = f"foot_points.mp4"
-        fourcc = cv2.VideoWriter_fourcc('m', 'p', '4', 'v')
-        video_wtr  = cv2.VideoWriter(output_mp4, fourcc=fourcc, fps=30.0, frameSize=(1280, 960))
-        if not video_wtr.isOpened():
-            print(f"Cannot open video writer.")
-            return
+    def eval_identifiabilities(self,tracking_dict):
+        """
+        各bboxの識別性を評価する
+        """
 
-        for i, frame in enumerate(self.keypoints):
-            if i >= 300: # only 10-sec, just for debug
-                break
-            # Read frame image file
-            frame_img_path = os.path.join(frame_img_root, f"{int(frame):06d}.jpg")
-            frame_img = cv2.imread(frame_img_path)
-            detections = self.keypoints[frame]
-            target_indices = self.kp_indice_torso if target_parts == "torso" else self.kp_indice_torso_legs
-            for det in detections:
-                keypoints = det["keypoints"]
-                confidences = [k for i2, k in enumerate(keypoints) if i2 in target_indices and k[2] >= score_thr]
-                if len(confidences) < (len(target_indices)):
-                    # Show bbox in red if doesn't meet the criteria
-                    bbox = det["bbox"]
-                    cv2.rectangle(frame_img, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), (0, 0, 255), thickness=2)
+        results = {}
+        frames, all_serials = zip(*[(value["Frame"],serial) for serial,value in tracking_dict.items()])
+        frame_serials_dict = self.make_dict(frames,all_serials)
+        del frames, all_serials
+        for frame,serials in frame_serials_dict.items():
+            for i, serial in enumerate(serials):
+                other_serials = [tmp_serial for tmp_serial in serials if serial != tmp_serial]
+                results[serial] = self._eval_identifiability(serial,other_serials) 
+        return results
 
-                left_ankle, right_ankle = keypoints[self.kp_indice_foot[0]], keypoints[self.kp_indice_foot[1]]
-                if float(left_ankle[2]) >= score_thr:
-                    color = (0, 255, 0)
-                else:
-                    #print(f"Low confidence on KP[15]: {float(fp1[2])}")
-                    color = (0, 0, 255)
-                cv2.circle(frame_img, (int(left_ankle[0]), int(left_ankle[1])), 5, color, 3)
-                
-                if float(right_ankle[2]) >= score_thr:
-                    color = (0, 255, 0)
-                else:
-                    #print(f"Low confidence on KP[16]: {float(fp2[2])}")
-                    color = (0, 0, 255)
-                cv2.circle(frame_img, (int(right_ankle[0]), int(right_ankle[1])), 5, color, 3)
-            frame_img = cv2.resize(frame_img, (1280, 960))
-            video_wtr.write(frame_img)
-        video_wtr.release()
-        print(f"Saved video file: {output_mp4}\n")
-
-    def draw_keypoints(self, frame_img, frame_id, out_file="kp_img.jpg"):
-        def draw_line(img, s1, s2, bbox):
-            color = (255, 0, 0) # Blue
-            cv2.line(img, (int(s1[0]), int(s1[1])),
-                (int(s2[0]), int(s2[1])), color, thickness=2)
-
-        def draw_dot(img, src, bbox):
-            color = (0, 255, 0) # Green
-            cv2.circle(img, (int(src[0]), int(src[1])), 5, color, 2)
-
-        frame_id = str(frame_id)
-        if not frame_id in self.keypoints:
-            print(f"There's no record asssiate with frame {frame_id} in the keypoint data.")
-            return
-
-        # Read frame image file
-        if os.path.isfile(frame_img):
-            img = cv2.imread(frame_img)
-        else:
-            print(f"There's no such image file {frame_img}.")
-            return
+    def _eval_identifiability(self,serial,other_serials,**kwargs):
+        # evaluate identifiability from pose estimation results        
+        kp = self.keypoints_results.get_keypoints(serial)
+        if kp == None:
+            condition, intersect_ratio, score, area = 4, 1 , 0, 0
+            return {"intersect_ratio":intersect_ratio,"condition":condition,"score":score}
         
-        detections = self.keypoints[str(frame_id)]
-        for det in detections:
-            keypoints = det["keypoints"]
-            bbox = det["bbox"]
+        x1,y1,x2,y2,bbox_confidence = kp["bbox"]
+        intersect_ratio = self._eval_intersect_with_other_bboxes(x1,y1,x2,y2,other_serials)
+        
+        kp = self.minimize_occluded_kp(kp,other_serials) 
+        
+        condition,score = self.eval_keypoints(kp["Keypoints"])  
+        area = int((x2-x1)*(y2-y1))
+        score = score if type(score) == int else float(score) #.astype(np.float16)
 
-            # draw lines
-            # 0 to 1, 2
-            draw_line(img, keypoints[0], keypoints[1], bbox)
-            draw_line(img, keypoints[0], keypoints[2], bbox)
-            # 1 to 2, 3
-            draw_line(img, keypoints[1], keypoints[2], bbox)
-            draw_line(img, keypoints[1], keypoints[3], bbox)
-            # 2 to 4
-            draw_line(img, keypoints[2], keypoints[4], bbox)
-            # 3 to 5
-            draw_line(img, keypoints[3], keypoints[5], bbox)
-            # 4 to 6
-            draw_line(img, keypoints[4], keypoints[6], bbox)
-            # 5 to 6, 7, 11
-            draw_line(img, keypoints[5], keypoints[6], bbox)
-            draw_line(img, keypoints[5], keypoints[7], bbox)
-            draw_line(img, keypoints[5], keypoints[11], bbox)
-            # 6 to 8, 12
-            draw_line(img, keypoints[6], keypoints[8], bbox)
-            draw_line(img, keypoints[6], keypoints[12], bbox)
-            # 7 to 9
-            draw_line(img, keypoints[7], keypoints[9], bbox)
-            # 8 to 10
-            draw_line(img, keypoints[8], keypoints[10], bbox)
-            # 11 to 12, 13
-            draw_line(img, keypoints[11], keypoints[12], bbox)
-            draw_line(img, keypoints[11], keypoints[13], bbox)
-            # 12 to 14
-            draw_line(img, keypoints[12], keypoints[14], bbox)
-            # 13 to 15
-            draw_line(img, keypoints[13], keypoints[15], bbox)
-            # 14 to 16
-            draw_line(img, keypoints[14], keypoints[16], bbox)
+        return {"intersect_ratio":intersect_ratio,"condition":condition,"score":score} #,"area":int(area)
 
-            # Draw dots
-            for kp in keypoints:
-                draw_dot(img, (int(kp[0]), int(kp[1])), bbox)
+    def _eval_intersect_with_other_bboxes(self,x1,y1,x2,y2,other_serials):
+        """
+        他のbboxとのintersect_ratioを計算する
+        """
+        other_bboxes = []
+        for serial in other_serials:
+            x1_,y1_,x2_,y2_ = self.tracking_dict[serial]["Coordinate"].values() 
+            if y2_ > y2:
+                other_bboxes.append((x1_,y1_,x2_,y2_))
+        return PolygonProcessor.calculate_intersect_ratio((x1,y1,x2,y2),other_bboxes)
 
-        cv2.imwrite(out_file, img)
-        print(f"Saved keypoint file: {out_file}")
+    def eval_keypoints(self,keypoints):
+        """
+        keypointによって識別性を評価する
+        """
+
+        x_list, y_list, scores = zip(*keypoints)
+        scores = list(scores)
+        if np.min(scores) >= self.keypoint_th:
+            return 0, np.mean(scores)
+        if max(scores) < self.keypoint_th:
+            return 5, 0
+        if not self.verify_pose_consistency(y_list):
+            return 5, 0
+            
+        scores = self.check_hand_selfocclusion(x_list, y_list, scores)
+        if not self.check_head_occlusion(y_list):
+            scores = [max(score,self.keypoint_th) if i in head_indices else score for i,score in enumerate(scores) if (head_indices := self.unified_pose_format.get_indices("head"))]
+        
+        if np.min(scores) >= self.keypoint_th:
+            score = np.mean(scores)
+            condition = 1
+        else:
+            right_scores = [scores[idx] for idx in self.unified_pose_format.get_indices("right")]
+            left_scores = [scores[idx] for idx in self.unified_pose_format.get_indices("left")]
+
+            target_scores = left_scores if np.min(left_scores) > np.min(right_scores) else right_scores
+            min_score = np.min(target_scores)
+            score = np.mean(target_scores)
+            if min_score >= self.keypoint_th:
+                condition = 2
+            else:
+                face_scores = [scores[idx] for idx in self.unified_pose_format.get_indices("head")]
+                count = sum(tmp_score >= self.keypoint_th for tmp_score in target_scores)
+                #face_count = sum(tmp_score >= keypoint_th for tmp_score in face_scores)
+                if count/len(target_scores) > 0.5 : #or face_count>2
+                    condition = 3
+                else: 
+                    condition = 4
+        return condition, score
+
+    def check_head_occlusion(self, y_list):
+        """
+        顔のパーツの位置が肩より下、もしくは顔-肩と肩-尻距離の比によって顔のオクルージョンを判定する
+        """
+
+        face_y = max([y_list[idx] for idx in self.unified_pose_format.get_indices("head")])
+        shoulder_y = min([y_list[idx] for idx in self.unified_pose_format.get_indices("shoulder")])
+        hip_y = min([y_list[idx] for idx in self.unified_pose_format.get_indices("hip")])
+        if (shoulder_y - face_y == 0) or (shoulder_y - hip_y == 0):
+            is_occlusion = True
+            return is_occlusion
+
+        is_occlusion = True if face_y > shoulder_y or np.abs((shoulder_y - face_y)/(shoulder_y-hip_y)) < 0.2 else False
+        return is_occlusion
+    
+    def check_hand_selfocclusion(self,x_list, y_list, scores):
+        """
+        胴体の内部に存在する腕のscoreを置換する
+        torso_pointsでポリゴンが作れない場合はis_inside_listがNoneになる。
+        ⇒Poseの推定エラーなのでscoreを0に置換する
+        """
+
+        torso_points = [(x_list[index],y_list[index]) for index in self.unified_pose_format.get_indices("torso")]
+        arm_indices = self.unified_pose_format.get_indices("arm")
+        arm_points = [(x_list[index],y_list[index]) for index in arm_indices]  
+
+        is_inside_list = PolygonProcessor.check_is_inside(arm_points,torso_points)
+
+        if is_inside_list is None:
+            return len(scores)*[0]
+        for index, is_inside in zip(arm_indices,is_inside_list):
+            scores[index] = max(scores[index], self.keypoint_th) if is_inside else scores[index]
+        return scores
+
+    def verify_pose_consistency(self,y_list):
+        """
+        基本的にface座標は肩座標より小さく、肩座標は腰座標より小さい。
+        ⇒その一貫性を確かめる
+        """
+        face_y = max([y_list[idx] for idx in self.unified_pose_format.get_indices("head")])
+        shoulder_y = min([y_list[idx] for idx in self.unified_pose_format.get_indices("shoulder")])
+        waist_y = min([y_list[idx] for idx in self.unified_pose_format.get_indices("hip")])
+
+        if face_y >= shoulder_y or shoulder_y >= waist_y:
+            return False
+        else:
+            return True
+    
+    def minimize_occluded_kp(self,kp,other_serials,**kwargs):
+        """
+        オクルージョンが発生しているにも関わらず、confidenceが上がることがある
+        ⇒そのkeypointのconfidenceを0に置換する
+        """
+        determination_method = kwargs.get('determination_method', "keypoint")
+
+        def _bbox2polygon(x1,y1,x2,y2):
+            return [(x1, y1), (x1, y2), (x2, y2), (x2, y1)]
+
+        def check_bbox_overlap(bbox1, bbox2):
+            x1_min, y1_min, x1_max, y1_max = bbox1
+            x2_min, y2_min, x2_max, y2_max = bbox2
+            return not (x1_max < x2_min or x2_max < x1_min or y1_max < y2_min or y2_max < y1_min)
+
+        x1,y1,x2,y2,bbox_confidence = kp["bbox"]
+        x_list, y_list, scores = zip(*kp["Keypoints"])
+        points = [(x,y) for x,y in zip(x_list,y_list)]
+
+        for serial in other_serials:
+            if determination_method == "bbox":
+                x1_,y1_,x2_,y2_ = self.tracking_dict[serial]["Coordinate"].values()
+                polygon_points = self._bbox2polygon(x1_,y1_,x2_,y2_)
+            elif determination_method == "keypoint":
+                other_kp = self.keypoints_results.get_keypoints(serial)
+                x1_,y1_,x2_,y2_,bbox_confidence_ = other_kp["bbox"]
+                polygon_points = [(x,y) for x,y,score in other_kp["Keypoints"]]
+            else:
+                raise ValueError("determination method")
+
+            if y2_ < y2: #target bbox is not occluded
+                continue
+            if not check_bbox_overlap((x1,y1,x2,y2),(x1_,y1_,x2_,y2_)):
+                continue
+
+            is_inside_list = PolygonProcessor.check_is_inside(points, polygon_points)
+            for i, is_inside in enumerate(is_inside_list):
+                if is_inside:
+                    kp["Keypoints"][i][2]=0 #0:x, 1:y, 2:confidence
+        return kp
+
+
+

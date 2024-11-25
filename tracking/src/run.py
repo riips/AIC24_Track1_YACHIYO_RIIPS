@@ -1,116 +1,144 @@
 import os
 import json
+import glob
 import argparse
 from datetime import datetime
+import sys
 
-from tracking import Tracker
-from utils import DetectedObjects
+from utils import DetectedObjects, JSONHandler, get_camera_ids
 
-def run_scpt(feature_data_root, out_dir="outdir", tracking_params={}):
-    # Load and generate "detected object list"
-    tracking_results = {}
+import pose
+from pose import IdentifiabilityEvaluator
+
+def run_preprocess(feature_data_root, camera_id=None, out_dir="outdir",common_params={}):
     if not os.path.isdir(feature_data_root):
         raise Exception(f"No such directory: {feature_data_root}")
-    if os.path.basename(feature_data_root).startswith("camera_"):
-        camera_ids = [os.path.basename(feature_data_root)]
-        feature_data_root = os.path.dirname(feature_data_root)
-        is_multi = False
-    else:
-        camera_ids = [cam_id for cam_id in os.listdir(feature_data_root) if cam_id[:7] == "camera_"]
-        is_multi = True
-
     # loading detections
-    for camera_id in camera_ids:
-        data_dir = os.path.join(feature_data_root, camera_id)
-        camera_id = int(camera_id[7:])
-        detected_objects = load_detections(data_dir)
-        tracking_results[camera_id] = detected_objects.to_trackingdict()
-        del detected_objects
+    tracking_results = {}
+    detected_objects = load_detections(feature_data_root,common_params=common_params)
+    tracking_results[camera_id] = detected_objects.to_trackingdict()
+    del detected_objects
+    os.makedirs(out_dir, exist_ok=True)
+    JSONHandler.save_json(tracking_results,os.path.join(out_dir, f'camera{camera_id:03d}_results.json'))
+
+    identifiability_results = {}
+    evaluator = IdentifiabilityEvaluator(tracking_dict=tracking_results[camera_id], common_params=common_params)
+    # evaluator.load_keypoint_result()
+    identifiability_results[camera_id] = evaluator.eval_identifiabilities(tracking_results[camera_id])
+    JSONHandler.save_json(identifiability_results,os.path.join(out_dir, f'camera{camera_id:03d}_identifiability.json'))
+
+def run_scpt(scene_id,camera_id,json_dir=None,out_dir="outdir",common_params={}, tracking_params={}):
+    from scpt import OfflineSingleCameraTracker
+    # Load and generate "detected object list"
     
-    # Run SCT on all detections of all cameras
-    for camera_id in tracking_results:
-        tracking_dict = tracking_results[camera_id]
-        start_time = datetime.now()
-        tracker = Tracker(tracking_params)
-        tracking_results[camera_id] = tracker.scpt(tracking_dict) # tracking returns tracking_dict
-        end_time = datetime.now()
-        print(f"Camera{camera_id} elapsed time: {end_time - start_time}")
-
-        # Dump the result
-        out_json = os.path.join(out_dir, f'camera{camera_id:03d}_tracking_results.json')
-        os.makedirs(os.path.dirname(out_json), exist_ok=True)
-        with open(out_json, mode='w') as f:
-            json.dump(tracking_results[camera_id], f)        
-
-def run_mcpt(scene_id, json_dir,out_dir="outdir", tracking_params={}):
-    start_time = datetime.now()
-    tracker = Tracker(tracking_params)
-    whole_tracking_result = tracker.mcpt(scene_id, json_dir,out_dir)
-    
-    # Dump the result
-    out_file = os.path.join(out_dir, 'whole_tracking_results.json')
-    with open(out_file, mode='w') as f:
-        json.dump(whole_tracking_result, f)
-    end_time = datetime.now()
-    print(f"Elapsed_time: {end_time - start_time}")
-
-
-def correct_scpt_result(scene_id, json_dir, out_dir=None, tracking_params={}):
     if not os.path.isdir(json_dir):
         raise Exception(f"The directory '{json_dir}' does not exist.")
     if out_dir == None:
         out_dir = json_dir
+    start_time = datetime.now()
+
+    tracking_results = JSONHandler.open_json(os.path.join(json_dir, f"camera{str(camera_id).zfill(3)}_results.json")) 
+    identifiability_results = JSONHandler.open_json(os.path.join(json_dir, f"camera{str(camera_id).zfill(3)}_identifiability.json")) 
+
+    tracker = OfflineSingleCameraTracker(tracking_results[str(camera_id)],identifiability_results=identifiability_results[str(camera_id)],common_params=common_params, tracking_params=tracking_params)
+    tracking_results[str(camera_id)] = tracker.run_tracking() # tracking returns tracking_dict
+    end_time = datetime.now()
+    print(f"Camera{camera_id} elapsed time: {end_time - start_time}")
+
+    # Dump the result
+    os.makedirs(out_dir, exist_ok=True)
+    JSONHandler.save_json(tracking_results,os.path.join(out_dir, f'camera{camera_id:03d}_results.json'))
+
+def run_mcpt(scene_id, json_dir, out_dir="outdir", common_params={},tracking_params={}):
+    from mcpt import OfflineMultiCameraTracker
+    start_time = datetime.now()
+
+    tracker = OfflineMultiCameraTracker(JSONHandler.concat_jsons(json_dir,startwith="postprocessed_camera",endwith="results"),
+                                        JSONHandler.concat_jsons(json_dir,endwith="identifiability"),
+                                        out_dir,common_params=common_params, tracking_params=tracking_params)
+    whole_tracking_result = tracker.run_tracking() #scene_id, json_dir,out_dir
     
-    json_files = [f for f in os.listdir(json_dir) if os.path.splitext(f)[1].lower() == ".json" and f.startswith("camera")]
-    json_files = sorted(json_files)
-    for json_file in json_files:
-        camera_id = int(json_file.split("_")[0][6:])
-        with open(os.path.join(json_dir, json_file)) as f:
-            tracking_dict = json.load(f)
-        tracker = Tracker(tracking_params)
-        tracking_dict = tracker.correcting_scpt_result(tracking_dict) 
-        out_file = os.path.join(out_dir, "fixed_"+os.path.basename(json_file))
-        with open(out_file, mode='w') as f:
-            json.dump(tracking_dict, f)
+    # Dump the result
+    JSONHandler.save_json(whole_tracking_result,os.path.join(out_dir, 'multi_camera_results.json'))
+    end_time = datetime.now()
+    print(f"Elapsed_time: {end_time - start_time}\n")
 
-def correct_mcpt_result(scene_id,json_dir,out_dir,tracking_params={}):
-    with open(os.path.join(json_dir, 'whole_tracking_results.json')) as f:
-        tracking_results = json.load(f)
-    with open(os.path.join(json_dir, f"representative_nodes_scene{str(scene_id)}.json")) as f:
-        representative_nodes = json.load(f)
-    tracker = Tracker(tracking_params)
-    tracking_resuluts = tracker.correcting_mcpt_result(scene_id,tracking_results,representative_nodes)
-    out_file = os.path.join(out_dir, "fixed_whole_tracking_results.json")
-    with open(out_file, mode='w') as f:
-        json.dump(tracking_resuluts, f)
+def run_scpt_postprocess(scene_id,camera_id, json_dir, out_dir=None, params={}):
+    from scpt import SCPTPostProcessor
+    
+    if not os.path.isdir(json_dir):
+        raise Exception(f"The directory '{json_dir}' does not exist.")
+    if out_dir == None:
+        out_dir = json_dir
+
+    json_file = f"camera{str(camera_id).zfill(3)}_results.json"
+    tracking_results = JSONHandler.open_json(os.path.join(json_dir, json_file))
+
+    processor = SCPTPostProcessor(tracking_results[str(camera_id)], params=params)
+    tracking_results[str(camera_id)] = processor.run_scpt_postprocess()
+    JSONHandler.save_json(tracking_results, os.path.join(out_dir, "postprocessed_"+os.path.basename(json_file)))
 
 
-def load_detections(data_root, debug=False):
+def run_mcpt_postprocess(scene_id,json_dir,out_dir,params={}): #common_params={},tracking_
+    from mcpt import MCPTPostProcessor
+
+    processor = MCPTPostProcessor(tracking_results = JSONHandler.open_json(os.path.join(json_dir, 'multi_camera_results.json')),
+                                  representative_nodes = JSONHandler.open_json(os.path.join(json_dir, f'representative_nodes.json')),
+                                  out_dir=out_dir,params=params)
+    tracking_results = processor.run_mcpt_postprocess() #scene_id,tracking_results
+    JSONHandler.save_json(tracking_results, os.path.join(out_dir, "postprocessed_multi_camera_results.json"))
+
+def load_detections(data_root,common_params={}):
     print(f"Loading detections from {data_root}.")
-    detected_objects = DetectedObjects()
+    detected_objects = DetectedObjects(params=common_params)
     detected_objects.load_from_directory(feature_root=data_root)
     print(f"Found {len(detected_objects.objects)} frames, and {detected_objects.num_objects} objects.")
-    if debug:
-        frames = sorted(detected_objects.objects)
-        min_num_obj = 9999999
-        max_num_obj = 0
-        for frame in frames:
-            obj = detected_objects[frame]
-            num = len(obj)
-            min_num_obj = min(min_num_obj, num)
-            max_num_obj = max(max_num_obj, num)
-        print(f"###  MIN num detections: {min_num_obj},  MAX num detections: {max_num_obj} ###\n")
-
     return detected_objects
 
 def get_args():
     parser = argparse.ArgumentParser(description='Offline Tracker sample app.')
-    parser.add_argument('-d', '--data', default='EmbedFeature/scene_001', type=str)
-    parser.add_argument('-o', '--outdir', default='output', type=str)
+    parser.add_argument('-s', '--scene', type=int, required=True)
 
     return parser.parse_args()
 
 if __name__ == "__main__":
     args = get_args()
 
-    run(feature_data_root=args.data, out_dir=args.outdir, tracking_params={})
+    # Common parameters
+    common_params={"scene_id":args.scene,"camera_id":12}
+
+    # Preprocessing parameters
+    preprocess_params = {"keypoint_th":0.7}
+
+    # SCPT parameters
+    scpt_params={"epsilon": 0.15,"is_print_parameters":False,"frame_period":90,"is_exclude_low_identifiable_img":True} #,"is_use_motion":False
+    scpt_postprocess_params={"short_tracklet_th":20, "alpha":0.3, "is_run_sequential_nms":False, "is_run_separate_warp": False, "is_run_exclude_short_track": False, "is_run_exclude_motionless_track": False}
+
+    # MCPT parameters
+    mcpt_params={"scene_id":args.scene,"epsilon": 0.35,"keypoint_th":0.7,"resample_representative":True}
+    mcpt_postprocess_params={"scene_id":args.scene,"is_print_parameters":True,"delete_distant_person":False,"interpolate_track":False,"remove_noise_image":False}
+
+    emb_model = "osnet_x1_0" #   "synthetic_osnet"
+    out_sct_dir = f"scene_{args.scene:02}"
+
+    # Getting camera IDs from scene ID
+    camera_ids = get_camera_ids(args.scene, "tracking/config/scene_2_camera_id_file.json")
+    print(f"Target scene ID: {args.scene}, camera IDs: {camera_ids}")
+
+    # SCPT for all cameras
+    for i, camera_id in enumerate(camera_ids):
+        scpt_params["is_print_parameters"] = True if i == 0 else False
+        common_params["camera_id"] = camera_id
+        feature_data_root=os.path.join("EmbedFeature", emb_model, f"Scene{str(args.scene).zfill(2)}",f"Camera{str(camera_id).zfill(3)}")
+        run_preprocess(feature_data_root=feature_data_root, out_dir=out_sct_dir, camera_id=camera_id, common_params=common_params)
+
+        scpt_params["is_print_parameters"] = True if i == 0 else False
+        common_params["camera_id"] = camera_id
+        run_scpt(scene_id=args.scene, camera_id=camera_id, out_dir=out_sct_dir, json_dir=out_sct_dir, common_params=common_params, tracking_params=scpt_params)
+
+        scpt_postprocess_params["is_print_parameters"] = True if i == 0 else False
+        run_scpt_postprocess(scene_id=args.scene, camera_id=camera_id, json_dir=out_sct_dir, out_dir=out_sct_dir, params=scpt_postprocess_params)
+
+    # MCPT
+    run_mcpt(scene_id=args.scene, json_dir=out_sct_dir, out_dir=out_sct_dir, common_params=common_params, tracking_params=mcpt_params)  
+    run_mcpt_postprocess(scene_id=args.scene, json_dir=out_sct_dir, out_dir=out_sct_dir, params=mcpt_postprocess_params)

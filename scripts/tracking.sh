@@ -4,6 +4,6 @@ SCENE=$*
 
 for SCENE in $*
 do
-    echo Procssing scene-$SCENE
-    python tracking/infer.py -s $SCENE
+    echo Processing scene-$SCENE
+    python tracking/src/run.py -s $SCENE
 done

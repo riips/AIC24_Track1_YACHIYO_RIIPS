@@ -1,20 +1,320 @@
+from PIL import Image, ImageDraw, ImageFont
+import matplotlib.pyplot as plt
+import random
+import cv2
+import shutil
+
 import os
 import numpy as np
 import json
 import glob
+import sys
+
+from collections import defaultdict, Counter
+from sklearn.metrics.pairwise import cosine_similarity
+from itertools import combinations, permutations, product, chain
+from scipy.cluster.hierarchy import dendrogram, linkage, fcluster
+from scipy.spatial.distance import squareform
+
+# import pose
+from parameters import CommonParameters
 
 
-class DetectedObjects:
+class ArrayCalculator:
+    """
+    ■Todo
+    一部関数の実行元がArrayになってないかも
+    """
+    @staticmethod
+    def translate_world_coordinate(x, y, homography_matrix):
+        # translate camera coordinate to world coordinate
+        vector_xyz = np.array([x, y, 1]) # z=1
+        vector_xyz_3d = np.dot(np.linalg.inv(homography_matrix), vector_xyz.T)
+        return vector_xyz_3d[0] / vector_xyz_3d[2], vector_xyz_3d[1] / vector_xyz_3d[2]
+
+    @staticmethod
+    def measure_aspect_ratios(self,coordinates):
+        x1, y1, x2, y2 = coordinates[:, 0], coordinates[:, 1], coordinates[:, 2], coordinates[:, 3] 
+        return (y2-y1)/(x2-x1)
+
+    @staticmethod
+    def run_ratio_test(matrix:np.ndarray,axis=0):
+        if axis not in [0, 1]:
+            raise ValueError("axis must be 0 or 1")
+        max_values = np.max(matrix, axis=axis)
+        len_row, len_col = matrix.shape
+
+        if axis == 0:
+            second_values = np.partition(matrix, -2, axis=axis)[-2, :] if len_row > 1 else np.zeros(len_col)
+        else:
+            second_values =  np.partition(matrix, -2, axis=axis)[:, -2] if len_col > 1 else np.zeros(len_row)
+
+        ratio_test_results = np.divide(second_values, max_values, out=np.ones(len(max_values)), where=max_values != 0)
+        return max_values, ratio_test_results
+
+    @staticmethod
+    def sigmoid(x):
+        return 1 / (1 + np.exp(-x))
+
+    @staticmethod
+    def measure_euclidean_distances(list1,list2):
+        points1 = np.array(list1)
+        points2 = np.array(list2)
+        diff = points1-points2
+        return np.sqrt(np.sum(diff**2, axis=1))
+
+    @staticmethod
+    def _compute_intersection_area(bboxes1, bboxes2, mode):
+        # Calculate the intersection areas and bounding box areas
+        x1_1, y1_1, x2_1, y2_1 = bboxes1[:, 0], bboxes1[:, 1], bboxes1[:, 2], bboxes1[:, 3]
+        x1_2, y1_2, x2_2, y2_2 = bboxes2[:, 0], bboxes2[:, 1], bboxes2[:, 2], bboxes2[:, 3]
+
+        inter_x1 = np.maximum(x1_1[:, None] if mode == "all_combinations" else x1_1, x1_2)
+        inter_y1 = np.maximum(y1_1[:, None] if mode == "all_combinations" else y1_1, y1_2)
+        inter_x2 = np.minimum(x2_1[:, None] if mode == "all_combinations" else x2_1, x2_2)
+        inter_y2 = np.minimum(y2_1[:, None] if mode == "all_combinations" else y2_1, y2_2)
+
+        inter_width = np.maximum(0, inter_x2 - inter_x1)
+        inter_height = np.maximum(0, inter_y2 - inter_y1)
+        intersection = inter_width * inter_height
+
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+
+        return intersection, area1, area2
+
+    @staticmethod
+    def compute_iou(bboxes1, bboxes2, mode="all_combinations"): 
+        intersection, area1, area2 = ArrayCalculator._compute_intersection_area(bboxes1, bboxes2, mode)
+        iou = intersection / (area1[:, None] + area2 - intersection) if mode == "all_combinations" else intersection / (area1 + area2 - intersection)
+        return iou
+
+    @staticmethod
+    def compute_overlap_coefficient(bboxes1, bboxes2, mode="elementwise"):
+        intersection, area1, area2 = ArrayCalculator._compute_intersection_area(bboxes1, bboxes2, mode)
+        overlap_coefficient = intersection / np.minimum(area1[:, None], area2) if mode == "all_combinations" else intersection / np.minimum(area1, area2)
+        return overlap_coefficient
+     
+class JSONHandler:
+    @staticmethod
+    def save_json(dict_, json_path):
+        os.makedirs(os.path.dirname(json_path),exist_ok=True)
+        try:
+            with open(json_path, mode='w') as f:
+                json.dump(dict_, f)
+        except OSError as e:
+            raise Exception(f"Error creating directory or writing file: {e}")
+
+    @staticmethod
+    def open_json(json_path):
+        if not os.path.exists(json_path):
+            raise FileNotFoundError(f"File not found: {json_path}")
+        with open(json_path) as f:
+            json_file = json.load(f)
+        return json_file
+    
+    @staticmethod
+    def concat_jsons(json_dir, startwith="",endwith=""):
+        json_paths = sorted(glob.glob(os.path.join(json_dir,f"{startwith}*{endwith}.json")))
+        jsons = {}
+        for json_path in json_paths:
+            json_ = JSONHandler.open_json(os.path.join(json_path))
+            jsons.update(json_)
+        return jsons
+
+class ParameterManager:
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+    def update_params(self, params_dict):
+        for key, value in params_dict.items():
+            if hasattr(self, key):
+                setattr(self, key, value)
+            else:
+                raise ReferenceError(f"The parameter '{key}' has not been set.")
+
+class DirectoryStructure(CommonParameters,ParameterManager):
+    def __init__(self,common_params=None):
+        CommonParameters.__init__(self)
+        ParameterManager.__init__(self)
+        if common_params:
+            self.update_params(common_params)
+
+    def _get_frame_dir(self):
+        dir_ = os.path.join("Frames",f"Scene{str(self.scene_id).zfill(self.scene_digit)}",f"Camera{str(self.camera_id).zfill(self.camera_digit)}")
+        return dir_
+
+    def _get_feature_dir(self,):
+        dir_ = os.path.join("EmbedFeature",f"{self.emb_model}",f"Scene{str(self.scene_id).zfill(self.scene_digit)}",f"Camera{str(self.camera_id).zfill(self.camera_digit)}")
+        return dir_
+
+    def _get_result_dir(self,):
+        return
+
+    def _get_pose_dir(self,):
+        dir_ = os.path.join("Poses",f"{self.pose_model}",f"{self.pose_format}",f"Scene{str(self.scene_id).zfill(self.scene_digit)}",f"Camera{str(self.camera_id).zfill(self.camera_digit)}")
+        return dir_
+
+    def _get_pose_path(self,):
+        return os.path.join(self._get_pose_dir(),"keypoint.json")
+
+    def get_pose_result(self):
+        return JSONHandler.open_json(self._get_pose_path())
+    
+    def get_scpt_path(self,):
+        return
+
+
+class ClusteringFunctions:
+    @staticmethod
+    def agglomerative_clustering(distance_matrix,epsilon,metric="cosine"):  
+        # perform agglomerative hierarchical clustering
+        np.fill_diagonal(distance_matrix, 0) 
+        linked = linkage(squareform(distance_matrix), method='single', metric=metric)
+        return list(fcluster(linked, epsilon, criterion='distance')) # min(clusters)=1
+
+    @staticmethod
+    def dbscan(distance_matrix,min_samples=5,epsilon=0.2):
+        dbscan = DBSCAN(eps=epsilon,min_samples=min_samples,metric="precomputed")
+        clusters = dbscan.fit_predict(distance_matrix)
+        # coreindices = dbscan.core_sample_indices_
+        #assign a unique ID to each noise point
+        clusters = [cluster if cluster != -1 else -i  for i,cluster in enumerate(clusters)]
+        return clusters #self.reassign_sequential_ids(
+
+class TrackingFunctions():
+    def delete_variable(self, var_name):
+        if hasattr(self, var_name):
+            delattr(self, var_name)
+        else:
+            # print(f"'{var_name}' does not exist.")
+            pass
+
+    def loop(self, loop_list, function):
+        list_ = []
+        for loop_element in loop_list:
+            value = function(loop_element)
+            list_.append(value)
+        return list_
+    
+    def make_dict(self,keys,values):
+        new_dict = defaultdict(list)
+        for key, value in zip(keys, values):
+            if key is None:
+                continue
+            new_dict[key].append(value)
+        return dict(new_dict)
+
+    def get_max_value_of_dict(self, dictionary, key):
+        # get max value of any key from nested dictionary
+        max_value = float('-inf')  
+        for k, v in dictionary.items():
+            if isinstance(v, dict):
+                max_value = max(max_value, self.get_max_value_of_dict(v, key))
+            elif k == key:  
+                max_value = max(max_value, v)
+        return max_value
+
+    def get_min_lst_with_none(self,values):
+        filtered_values = list(filter(lambda x: x is not None, values))
+        return min(filtered_values) if filtered_values else None    
+
+    def reassign_sequential_ids(self,id_list):
+        unique_ids = list(set(id_list))
+        new_id_dict = {key:i for i,key in enumerate(unique_ids)} 
+        return [new_id_dict[old_id] for old_id in id_list]
+ 
+    def load_npy_from_npypath(self,npy_path):
+        return np.load(npy_path).reshape(1, -1)
+
+    def make_feature_stack(self, npy_paths):
+        feature_list = self.loop(npy_paths,self.load_npy_from_npypath)
+        return np.vstack(feature_list)
+
+    def similarity_matrix_by_npypaths(self,npy_paths):
+        # create a similarity matrix from features
+        feature_stack = self.make_feature_stack(npy_paths)
+        similarity_matrix = cosine_similarity(feature_stack).astype(np.float16)
+        return similarity_matrix
+    
+    def associate_cluster(self,clusters,centrality_matrix,epsilon,**kwargs):#, **parameters
+        # perform hierarchical clustering that targets clusters.
+        remove_noise_cluster = kwargs.get('remove_noise_cluster', True) #self.parameters["remove_noise_cluster"] #
+        cost_function = kwargs.get('cost_function', 1) #self.parameters["cost_function"] #
+        minimize = kwargs.get("minimize",True) #self.parameters["minimize"] 
+        """
+        cost_function:1 ⇒ single linkage like
+        cost_function:2 ⇒ average linkage like
+        """
+        np.fill_diagonal(centrality_matrix, 0)
+        clusters = np.array(clusters)
+        unique_clusters = np.sort(np.unique(clusters)) 
+
+        if remove_noise_cluster and -1 in unique_clusters:
+            unique_clusters = unique_clusters[unique_clusters != -1]
+
+        if cost_function == 2:
+            count = Counter(clusters)
+            if remove_noise_cluster and -1 in count.keys():
+                del count[-1]
+        centrality = np.max(centrality_matrix)
+
+        th = 1 - epsilon 
+        while centrality > th:
+            if cost_function == 1:
+                max_index = np.argmax(centrality_matrix)
+            elif cost_function == 2:
+                len_element_matrix = np.outer(list(count.values()),list(count.values())) 
+                averaged_centrality_matrix = np.multiply(centrality_matrix,1/len_element_matrix)
+                np.fill_diagonal(averaged_centrality_matrix, 0)
+                max_index = np.argmax(averaged_centrality_matrix)
+
+            cluster1_index, cluster2_index = np.unravel_index(max_index, centrality_matrix.shape)
+            
+            if cost_function == 1:
+                centrality = centrality_matrix[cluster1_index, cluster2_index]
+            elif cost_function == 2:
+                centrality = averaged_centrality_matrix[cluster1_index, cluster2_index]  
+            
+            if centrality < th:
+                break
+            
+            target_row = centrality_matrix[[cluster1_index,cluster2_index],:]
+            sum_row = np.sum(target_row,axis=0)
+            if minimize:
+                sum_row = np.where(np.min(target_row, axis=0) < 0, -1, sum_row)
+            centrality_matrix[:, cluster1_index] = sum_row
+            centrality_matrix[cluster1_index,:] = sum_row
+
+            next_indices = np.arange(len(unique_clusters))             
+            next_indices = next_indices[next_indices != cluster2_index]
+            centrality_matrix = centrality_matrix[np.ix_(next_indices,next_indices)] 
+            np.fill_diagonal(centrality_matrix, 0)
+
+            cluster1 = unique_clusters[cluster1_index]
+            cluster2 = unique_clusters[cluster2_index] 
+            clusters = np.where(clusters == cluster2, cluster1, clusters)
+            unique_clusters = unique_clusters[unique_clusters != cluster2]
+
+            if cost_function == 2:
+                count[cluster1] += count[cluster2]
+                del count[cluster2]
+            
+        return clusters
+
+
+class DetectedObjects(CommonParameters,ParameterManager):
     """
     Represents whole detected objects to track.
     Object dict is built by frame_id as a key and its entity contains a list of all Detected objects of the frame. 
     """
-    def __init__(self):
+    def __init__(self,params={}):
+        super().__init__(**params)
+
         self.num_objects = 0
         self.objects = {}
         self._objects_registered = {}
-        #self.scene_id = scene_id
-        #self.camera_id = -1
         self.camera_projection_matrix = None
         self.homography_matrix = None
 
@@ -25,32 +325,8 @@ class DetectedObjects:
         if not os.path.isdir(feature_root):
             raise Exception(f'There is no directory to read from. {feature_root}')
         npys = sorted(glob.glob(os.path.join(feature_root, "**/*.npy"), recursive=True))
-        scene_id = None
-        camera_id = None
-        path_list = feature_root.split("/")
-        for dir in path_list:  
-            if dir.startswith("scene_"):  
-                scene_id = int(dir.replace("scene_",""))
-            if dir.startswith("camera_"):  
-                camera_id = int(dir.replace("camera_",""))
-        if scene_id is not None and camera_id is not None:
-            calibration_path = f"Original/scene_{scene_id:03d}/camera_{camera_id:04d}/calibration.json"
-            self.load_calibration(calibration_path)
-        else:
-            print(f'\033[33mwarning\033[0m : failed to get scene_id and camera_id from feature path.')
-            print(f'\033[33mwarning\033[0m : world coordinate calculations are ignored.')
-
-
-        # Below is to parse camera id from the path, we're probably not going to use it though.
-        #camera_id = None
-        #dirs = npys[0].split("/")
-        #if len(dirs) < 2:
-        #    print(f"Cannot prop camera id from input path. {feature_path}")
-        #else:
-        #    camera_id = dirs[-1]
-        #    if "Camera" in camera_id:
-        #        self.camera_id = int(camera_id[len("Camera"):])
-        
+        calibration_path = os.path.join(calibration_path, f"scene_{self.scene_id:03d}", f"camera_{self.camera_id:04d}.json")
+        self.load_calibration(calibration_path)
         for f in npys:
             self.add_object_from_image_path(f)
 
@@ -142,8 +418,13 @@ class DetectedObjects:
         Compatibility function to convert detections in TrackingDict format.
         """
         track_dict = {}
-        for frame_id in self.objects:
-            for detected_object in self.objects[frame_id]:
+        for frame_id, detected_objects in self.objects.items():
+            """
+            ■メモ
+            detected_objectsに同一フレームのbbox情報が記録されている
+            """
+            for detected_object in detected_objects:
+
                 serial_no = detected_object.object_id
                 coordinate = json.loads(detected_object.coordinate.__str__())
                 if detected_object.worldcoordinate.__str__() != "None":
@@ -151,7 +432,7 @@ class DetectedObjects:
                 else:
                     world_coordinate = None
                 new_object = { "Frame": frame_id, "NpyPath": detected_object.feature_path,
-                               "Coordinate": coordinate, "WorldCoordinate": world_coordinate,  "OfflineID": -1 } #"ClusterID": None,
+                                "Coordinate": coordinate, "WorldCoordinate": world_coordinate,  "LocalID": -1 }
                 track_dict[serial_no] = new_object
         return track_dict
 
@@ -208,59 +489,28 @@ class WorldCoordinate:
     def __init__(self, x, y):
         self.x = float(x)
         self.y = float(y)
-
     def __str__(self):
         return(f'{{"x":{self.x}, "y":{self.y}}}')
 
-class TrackingCluster:
-    def __init__(self, camera_id, offline_id):
-        self.camera_id = camera_id
-        self.offline_id = 0
-        self.global_offline_id = -1
-        self.clusters = {}
-        self.serials = []
 
-    def add(self, serial):
-        if serial in self.serials:
-            raise Exception("DUP!")
-        self.serials.append(serial)
-        
+def get_camera_ids(scene_id, json_f="config/scene_2_camera_id_file.json"):
+    with open(json_f) as f:
+        scene2camera = json.load(f)
+    camera_ids = []
+    for scene_camera in scene2camera:
+        if scene_camera["scene_name"] == f"scene_{scene_id:03d}":
+            camera_ids = scene_camera["camera_ids"]
+            break
+    return camera_ids
 
-class TrackingClusters:
-    def __init__(self, camera_id):
-        self.camera_id = camera_id
-        self.clusters = []
-        self.offline_ids = []
+def get_scene_id(camera_id, json_f="config/scene_2_camera_id_file.json"):
+    with open(json_f) as f:
+        scene2camera = json.load(f)
+    for scene_camera in scene2camera:
+        if camera_id in scene_camera["camera_ids"]:
+            return int(scene_camera["scene_name"][6:])
+    return -1
 
-    def add(self, cluster: TrackingCluster):
-        cl_id = cluster.offline_id
-        if cl_id in self.offline_ids:
-            raise Exception("DUP!")
-        else:
-            self.clusters.append(cluster)
 
-    def get(self, cluster_id):
-        if not cluster_id in self.offline_ids:
-            raise Exception("No cluster_id registered. {cluster_id}")
-        else:
-            return self.clusters[offline_ids.index(cluster_id)]
 
-class feature_vector_shed:
-    def __init__(self):
-        self.features = {}
 
-    def add_vector(self, camera_id, serial_no, npy_path):
-        key = camera_id + "_" + serial_no
-        if key in self.features:
-            print(f"Feature vector of camera ID '{camera_id}' and serial no '{serial_no}' is already exist. ")
-            return
-            
-        if not os.path.isfile(npy_path):
-            print(f"The feature vector file '{npy_path}' does not exist. ")
-            return
-        feature = np.load(npy_path)
-        self.features[key] = feature
-
-    def get(self, camera_id, serial_no):
-        key = camera_id + "_" + serial_no
-        return self.features[key]
